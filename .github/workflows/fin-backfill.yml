@@ -1,0 +1,79 @@
+name: fin-backfill
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/60 * * * *"
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: pip install requests pandas pyarrow
+      - name: Pull financial indicators (paged, batch of 200 symbols)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > shard_worker.py <<'EOF'
+          import requests, json, time, os
+          import pandas as pd
+          H={"User-Agent":"Mozilla/5.0 Chrome/120.0","Referer":"https://emweb.securities.eastmoney.com/"}
+          url="https://datacenter-web.eastmoney.com/api/data/v1/get"
+          FIELDS={"report_date":"REPORT_DATE","announce_date":"NOTICE_DATE","roe":"ROEJQ","roa":"TOAZZL",
+           "gross_margin":"XSMLL","net_margin":"XSJLL","debt_ratio":"ZCFZL","current_ratio":"LD",
+           "revenue_ttm":"TOTALOPERATEREVE","profit_ttm":"PARENTNETPROFIT","eps":"EPSJB","bps":"BPS","ocf_ps":"MGJYXJJE"}
+          def fetch(code):
+              suf=".SH" if code.startswith(("6","9")) else (".BJ" if code.startswith(("4","8")) else ".SZ")
+              rows=[];page=1
+              while True:
+                  p={"reportName":"RPT_F10_FINANCE_MAINFINADATA","columns":"ALL",
+                     "filter":f'(SECUCODE="{code}{suf}")',"pageSize":"500","pageNumber":str(page),
+                     "sortColumns":"REPORT_DATE","sortTypes":"-1"}
+                  r=requests.get(url,params=p,headers=H,timeout=30)
+                  j=r.json();res=j.get("result")
+                  if not res or not res["data"]:break
+                  rows+=res["data"]
+                  if len(rows)>=res["count"]:break
+                  page+=1;time.sleep(0.2)
+              return rows
+          # symbol list: prefer repo manifest, else fetch full A-share list via API
+          if os.path.exists("symbols_hs_a.json"):
+              syms=[s["symbol"] for s in json.load(open("symbols_hs_a.json"))]
+          else:
+              syms=[l.strip() for l in open("symbols.txt") if l.strip()]
+          batch=int(os.environ.get("BATCH_IDX","0")); size=200
+          shard=syms[batch*size:(batch+1)*size]
+          all_rows=[]
+          for s in shard:
+              try: rows=fetch(s[2:])
+              except Exception: continue
+              for r_ in rows:
+                  rec={"symbol":s}
+                  for k,src in FIELDS.items():
+                      if r_.get(src) is not None: rec[k]=r_[src]
+                  if rec.get("report_date"):
+                      rec["report_date"]=rec["report_date"][:10]
+                      if rec.get("announce_date"): rec["announce_date"]=rec["announce_date"][:10]
+                      all_rows.append(rec)
+              time.sleep(0.2)
+          df=pd.DataFrame(all_rows)
+          if df.empty: print("no data"); raise SystemExit(0)
+          df["year"]=df["report_date"].str[:4]
+          os.makedirs("data/fin_indicator",exist_ok=True)
+          n=0
+          for y,g in df.groupby("year"):
+              f=f"data/fin_indicator/fin_indicator_{y}.parquet"
+              old=pd.read_parquet(f) if os.path.exists(f) else pd.DataFrame()
+              m=pd.concat([old.drop(columns=["year"],errors="ignore"),g.drop(columns=["year"])],ignore_index=True)
+              m=m.drop_duplicates(subset=["symbol","report_date"],keep="last").sort_values(["symbol","report_date"])
+              m.to_parquet(f,index=False); n+=1
+          print("merged",n,"year partitions", len(df),"rows")
+          EOF
+          BATCH_IDX=$(( $(date -u +%s) / 3600 % 28 )) python shard_worker.py
+      - name: Commit data
+        run: |
+          git config user.name dufuwuxin
+          git config user.email 3576982374@qq.com
+          git add data/ && git diff --cached --quiet || git commit -m "fin-backfill: $(date -u +%FT%TZ) batch"
+          git push
