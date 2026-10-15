@@ -77,5 +77,6 @@ jobs:
         run: |
           git config user.name dufuwuxin
           git config user.email 3576982374@qq.com
+          git pull --rebase origin main
           git add data/ && git diff --cached --quiet || git commit -m "fin-backfill: $(date -u +%FT%TZ) batch"
           git push
